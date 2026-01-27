@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+#
+# DESCRIPTION:
+#   Checks inbound and outbound throughput (bits/sec) for a Cisco interface.
+#   Supports IOS (ifTable) and ASA (ifXTable).
+#
+#   FIXED:
+#     - Uses ifHC* counters correctly
+#     - Stores previous counters + timestamp
+#     - Calculates real bits/sec using deltas
+#
+
+use strict;
+use warnings;
+
+use FindBin qw($Bin);
+use lib "/opt/opsview/perl/lib/perl5",
+        "$Bin/../lib",
+        "/opt/opsview/monitoringscripts/lib";
+
+use Net::SNMP;
+use Opsview::NagiosPlugin::SNMP;
+use File::Path qw(make_path);
+use POSIX qw(time);
+
+# ------------------------------------------------------------
+# Plugin setup
+# ------------------------------------------------------------
+my $np = Opsview::NagiosPlugin::SNMP->new(
+    usage     => "Usage: %s",
+    shortname => "check_snmp_bits_sec",
+    version   => "1.0",
+    blurb     => "Checks interface throughput (bits/sec) using SNMP ifXTable",
+    snmp      => {
+        "snmp-version" => "2c",
+        "snmp-timeout" => 5,
+        "v1-fallback"  => 1,
+    },
+);
+
+$np->add_arg( spec => "warning|w=s",  help => "Inbound warning threshold (bits/sec)" );
+$np->add_arg( spec => "critical|c=s", help => "Inbound critical threshold (bits/sec)" );
+$np->add_arg( spec => "x=s",          help => "Outbound warning threshold (bits/sec)" );
+$np->add_arg( spec => "d=s",          help => "Outbound critical threshold (bits/sec)" );
+$np->add_arg(
+    spec => "interface|i=s",
+    help => "Interface name (must match SNMP ifName / ifAlias / ifDescr exactly)"
+);
+
+$np->getopts;
+
+my $bi_warning  = $np->opts->warning;
+my $bi_critical = $np->opts->critical;
+my $bo_warning  = $np->opts->x;
+my $bo_critical = $np->opts->d;
+my $ifname      = $np->opts->interface;
+
+my $s = $np->snmp;
+
+for ( $bi_warning, $bi_critical, $bo_warning, $bo_critical, $ifname ) {
+    if ( !defined $_ || $_ eq '' ) {
+        print "UNKNOWN - Must specify thresholds and interface\n";
+        exit 3;
+    }
+}
+
+# ------------------------------------------------------------
+# OIDs
+# ------------------------------------------------------------
+my $oid_sysDescr = ".1.3.6.1.2.1.1.1.0";
+
+my $oid_ifDescr = ".1.3.6.1.2.1.2.2.1.2";
+my $oid_ifName  = ".1.3.6.1.2.1.31.1.1.1.1";
+my $oid_ifAlias = ".1.3.6.1.2.1.31.1.1.1.18";
+
+my $oid_hc_in   = ".1.3.6.1.2.1.31.1.1.1.6";   # ifHCInOctets
+my $oid_hc_out  = ".1.3.6.1.2.1.31.1.1.1.10";  # ifHCOutOctets
+
+# ------------------------------------------------------------
+# SNMP connectivity check
+# ------------------------------------------------------------
+unless ( defined $s->get_request($oid_sysDescr) ) {
+    print "UNKNOWN - SNMP agent not responding\n";
+    exit 3;
+}
+
+# ------------------------------------------------------------
+# Resolve interface index
+# ------------------------------------------------------------
+sub get_ifindex {
+    my ($iface) = @_;
+
+    for my $oid ( $oid_ifName, $oid_ifAlias, $oid_ifDescr ) {
+        my $result = $s->get_entries( -columns => [$oid] );
+        next unless defined $result;
+
+        for my $k ( keys %$result ) {
+            if ( defined $result->{$k} && $result->{$k} eq $iface ) {
+                $k =~ s/.*\.//;
+                return $k;
+            }
+        }
+    }
+    return -1;
+}
+
+my $ifindex = get_ifindex($ifname);
+
+if ( $ifindex == -1 ) {
+    print "UNKNOWN - The interface specified could not be found on this device!\n";
+    exit 3;
+}
+
+# ------------------------------------------------------------
+# Read counters
+# ------------------------------------------------------------
+my $oid_in  = "$oid_hc_in.$ifindex";
+my $oid_out = "$oid_hc_out.$ifindex";
+
+$s->get_request( $oid_in, $oid_out );
+
+my $octets_in  = $s->var_bind_list()->{$oid_in};
+my $octets_out = $s->var_bind_list()->{$oid_out};
+
+unless ( defined $octets_in && defined $octets_out ) {
+    print "UNKNOWN - Failed to retrieve interface counters\n";
+    exit 3;
+}
+
+# ------------------------------------------------------------
+# Rate calculation using state file
+# ------------------------------------------------------------
+my $state_dir = "/var/tmp/check_snmp_bits_sec";
+make_path($state_dir) unless -d $state_dir;
+
+my $host = $np->opts->hostname || "unknown";
+$host =~ s/[^A-Za-z0-9_.-]/_/g;
+
+my $statefile = "$state_dir/$host-$ifindex.state";
+
+my $now = time;
+my ( $last_time, $last_in, $last_out ) = ( 0, 0, 0 );
+
+if ( open my $rfh, '<', $statefile ) {
+    chomp( $last_time = <$rfh> );
+    chomp( $last_in   = <$rfh> );
+    chomp( $last_out  = <$rfh> );
+    close $rfh;
+}
+
+open my $wfh, '>', $statefile;
+print $wfh "$now\n$octets_in\n$octets_out\n";
+close $wfh;
+
+# First run or counter reset
+if ( $last_time == 0
+     || $octets_in < $last_in
+     || $octets_out < $last_out )
+{
+    print "OK - Initial sample collected | bits_sec_in=0 bits_sec_out=0\n";
+    exit 0;
+}
+
+my $delta_time = $now - $last_time;
+if ( $delta_time <= 0 ) {
+    print "UNKNOWN - Invalid time delta\n";
+    exit 3;
+}
+
+my $bits_in  = int( ( ( $octets_in  - $last_in  ) * 8 ) / $delta_time );
+my $bits_out = int( ( ( $octets_out - $last_out ) * 8 ) / $delta_time );
+
+# ------------------------------------------------------------
+# Threshold evaluation
+# ------------------------------------------------------------
+my ( $status, $rc ) = ( "OK", 0 );
+
+if ( $bits_in >= $bi_critical || $bits_out >= $bo_critical ) {
+    $status = "CRITICAL";
+    $rc     = 2;
+}
+elsif ( $bits_in >= $bi_warning || $bits_out >= $bo_warning ) {
+    $status = "WARNING";
+    $rc     = 1;
+}
+
+my $perfdata = "bits_sec_in=$bits_in bits_sec_out=$bits_out";
+
+print "$status - $bits_in bits/sec in, $bits_out bits/sec out | $perfdata\n";
+exit $rc;
