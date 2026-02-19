@@ -6,7 +6,8 @@ Drop-in Python replacement for rrd2perfdata.pl.
 Requirements: rrdtool CLI available in PATH. No external Python packages required.
 
 Behavior:
-- Iterates hosts -> servicechecks -> metrics under RRD_ROOT (like the Perl script)
+- ./rrd2perfdata.py -i /opt/opsview/timeseriesrrd/var/data -o /tmp/data_out -p 4
+- Iterates hosts > servicechecks > metrics under RRD_ROOT (like the Perl script)
 - Uses rrdtool dump to create XML and parses timestamps from comments + <row>/<v>
 - Reads +metadata.db (SQLite) for uom when present
 - Writes per-task temp output directories under OUT_DIR, then combines:
